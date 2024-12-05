@@ -10,6 +10,8 @@ import android.os.BatteryManager;
 import java.io.File;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Handle the cleanup of scrcpy, even if the main process is killed.
@@ -24,6 +26,7 @@ public final class CleanUp {
     private boolean pendingRestoreDisplayPower;
 
     private Thread thread;
+    private boolean interrupted;
 
     private CleanUp(Options options) {
         thread = new Thread(() -> runCleanUp(options), "cleanup");
@@ -34,8 +37,10 @@ public final class CleanUp {
         return new CleanUp(options);
     }
 
-    public void interrupt() {
-        thread.interrupt();
+    public synchronized void interrupt() {
+        // Do not use thread.interrupt() because only the wait() call must be interrupted, not Command.exec()
+        interrupted = true;
+        notify();
     }
 
     public void join() throws InterruptedException {
@@ -97,25 +102,29 @@ public final class CleanUp {
 
         try {
             run(displayId, restoreStayOn, disableShowTouches, powerOffScreen, restoreScreenOffTimeout);
-        } catch (InterruptedException e) {
-            // ignore
         } catch (IOException e) {
             Ln.e("Clean up I/O exception", e);
         }
     }
 
     private void run(int displayId, int restoreStayOn, boolean disableShowTouches, boolean powerOffScreen, int restoreScreenOffTimeout)
-            throws IOException, InterruptedException {
-        String[] cmd = {
-                "app_process",
-                "/",
-                CleanUp.class.getName(),
-                String.valueOf(displayId),
-                String.valueOf(restoreStayOn),
-                String.valueOf(disableShowTouches),
-                String.valueOf(powerOffScreen),
-                String.valueOf(restoreScreenOffTimeout),
-        };
+            throws IOException {
+
+        List<String> cmd = new ArrayList<>();
+        if (new File("/system/bin/setsid").exists()) {
+            cmd.add("/system/bin/setsid");
+        } else if (new File("/system/bin/nohup").exists()) {
+            cmd.add("/system/bin/nohup");
+        }
+
+        cmd.add("app_process");
+        cmd.add("/");
+        cmd.add(CleanUp.class.getName());
+        cmd.add(String.valueOf(displayId));
+        cmd.add(String.valueOf(restoreStayOn));
+        cmd.add(String.valueOf(disableShowTouches));
+        cmd.add(String.valueOf(powerOffScreen));
+        cmd.add(String.valueOf(restoreScreenOffTimeout));
 
         ProcessBuilder builder = new ProcessBuilder(cmd);
         builder.environment().put("CLASSPATH", Server.SERVER_PATH);
@@ -126,8 +135,15 @@ public final class CleanUp {
             int localPendingChanges;
             boolean localPendingRestoreDisplayPower;
             synchronized (this) {
-                while (pendingChanges == 0) {
-                    wait();
+                while (!interrupted && pendingChanges == 0) {
+                    try {
+                        wait();
+                    } catch (InterruptedException e) {
+                        throw new AssertionError("Clean up thread MUST NOT be interrupted");
+                    }
+                }
+                if (interrupted) {
+                    break;
                 }
                 localPendingChanges = pendingChanges;
                 localPendingRestoreDisplayPower = pendingRestoreDisplayPower;
